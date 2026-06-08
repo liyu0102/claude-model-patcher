@@ -1,0 +1,15 @@
+{
+    "name": "claude-model-patcher",
+    "version": "1.0.0",
+    "description": "SillyTavern server plugin that patches new/custom Claude models (e.g. claude-opus-4-8) into ST's thinking-mode logic so they use the correct thinking behaviour (adaptive / extended / none).",
+    "type": "module",
+    "main": "index.js",
+    "license": "MIT",
+    "keywords": [
+        "sillytavern",
+        "sillytavern-plugin",
+        "claude",
+        "anthropic",
+        "thinking"
+    ]
+}
