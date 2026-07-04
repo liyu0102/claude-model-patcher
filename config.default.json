@@ -1,6 +1,7 @@
 {
     "enabled": true,
     "patchFrontend": true,
+    "openrouterMaxEffort": true,
     "backendFile": "",
     "frontendFile": "",
     "models": [

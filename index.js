@@ -82,6 +82,7 @@ function loadConfig() {
     const cfg = readJsonSafe(userCfgPath) || readJsonSafe(defaultCfgPath) || {};
     cfg.enabled = cfg.enabled !== false;
     cfg.patchFrontend = cfg.patchFrontend !== false;
+    cfg.openrouterMaxEffort = cfg.openrouterMaxEffort !== false;
     cfg.models = Array.isArray(cfg.models) ? cfg.models : [];
     return cfg;
 }
@@ -98,6 +99,7 @@ function sanitizeConfig(input) {
     const out = {
         enabled: input.enabled !== false,
         patchFrontend: input.patchFrontend !== false,
+        openrouterMaxEffort: input.openrouterMaxEffort !== false,
         backendFile: typeof input.backendFile === 'string' ? input.backendFile : '',
         frontendFile: typeof input.frontendFile === 'string' ? input.frontendFile : '',
         models: [],
@@ -250,6 +252,73 @@ function injectFrontend1m(content, suffix) {
     return { content: newContent, changed: newContent !== content, found: true };
 }
 
+/**
+ * OpenRouter reasoning effort fix (frontend, public/scripts/openai.js).
+ *
+ * getReasoningEffort() collapses the "max" (极高) reasoning level down to "high"
+ * for every string-effort source, including OpenRouter:
+ *   case reasoning_effort_types.max:
+ *       return reasoning_effort_types.high;
+ * So选择极高时 OpenRouter 实际收到的是 high。For adaptive Claude models routed
+ * through OpenRouter we want the real "max" to be preserved. We rewrite that one
+ * switch case so that OpenRouter + Claude keeps "max"; every other source keeps
+ * the original "high" fallback. Idempotent via a marker comment.
+ */
+function injectFrontendMaxEffort(content) {
+    const marker = 'claude-model-patcher: keep max effort for OpenRouter Claude';
+    if (content.includes(marker)) {
+        return { content, changed: false, found: true };
+    }
+    const re = /(case reasoning_effort_types\.max:[\r\n]+\s*)(return reasoning_effort_types\.high;)/;
+    const m = content.match(re);
+    if (!m) {
+        return { content, changed: false, found: false };
+    }
+    const inject =
+        `// ${marker}\n` +
+        '                if (chat_completion_sources.OPENROUTER === settings.chat_completion_source && /claude/i.test(model)) {\n' +
+        '                    return reasoning_effort_types.max;\n' +
+        '                }\n' +
+        '                ';
+    const replacement = `${m[1]}${inject}${m[2]}`;
+    const newContent = content.replace(re, () => replacement);
+    return { content: newContent, changed: newContent !== content, found: true };
+}
+
+/**
+ * OpenRouter verbosity link (backend, chat-completions.js).
+ *
+ * For the newest adaptive Claude models (opus 4.8 / fable 5) OpenRouter IGNORES
+ * reasoning.effort and instead reads `verbosity` (which it maps to Anthropic's
+ * output_config.effort). So sending effort=max alone does not actually raise the
+ * thinking budget. When 极高 (reasoning_effort === 'max') is selected on an
+ * OpenRouter Claude model, we mirror it into verbosity=max right AFTER the stock
+ * verbosity block so it wins. Idempotent via a marker comment.
+ */
+function injectBackendVerbosityLink(content) {
+    const marker = 'claude-model-patcher: link verbosity to max effort';
+    if (content.includes(marker)) {
+        return { content, changed: false, found: true };
+    }
+    // Anchor on the OpenRouter-only reasoning line, then extend through its
+    // immediately-following verbosity block (the first `request.body.verbosity`
+    // block after it), and append the mirror.
+    const re = /(bodyParams\['reasoning'\]\['effort'\] = request\.body\.reasoning_effort;[\s\S]*?if \(request\.body\.verbosity\) \{[\s\S]*?bodyParams\['verbosity'\] = request\.body\.verbosity;[\s\S]*?\})/;
+    const m = content.match(re);
+    if (!m) {
+        return { content, changed: false, found: false };
+    }
+    const inject =
+        '\n\n' +
+        `            // ${marker}\n` +
+        "            if (request.body.reasoning_effort === 'max' && /^anthropic\\/claude/.test(request.body.model)) {\n" +
+        "                bodyParams['verbosity'] = 'max';\n" +
+        '            }';
+    const replacement = `${m[1]}${inject}`;
+    const newContent = content.replace(re, () => replacement);
+    return { content: newContent, changed: newContent !== content, found: true };
+}
+
 function backupOnce(file) {
     const bak = `${file}.cmp-bak`;
     if (!fs.existsSync(bak)) {
@@ -310,6 +379,13 @@ function patchBackend(cfg) {
         }
     }
 
+    if (cfg.openrouterMaxEffort) {
+        const r = injectBackendVerbosityLink(content);
+        if (!r.found) WARN('OpenRouter reasoning/verbosity block not found (ST internals changed?)');
+        if (r.changed) notes.push('OpenRouter -> verbosity=max on max effort');
+        content = r.content;
+    }
+
     if (content !== original) {
         backupOnce(file);
         fs.writeFileSync(file, content, 'utf8');
@@ -327,7 +403,7 @@ function patchFrontend(cfg) {
         return { ok: false, changed: false };
     }
     const models1m = cfg.models.filter(m => m && m.id && m.context1m);
-    if (models1m.length === 0) {
+    if (models1m.length === 0 && !cfg.openrouterMaxEffort) {
         return { ok: true, changed: false };
     }
     LOG(`Frontend target: ${file}`);
@@ -344,6 +420,13 @@ function patchFrontend(cfg) {
             break;
         }
         if (r.changed) notes.push(`${model.id} -> 1M context`);
+        content = r.content;
+    }
+
+    if (cfg.openrouterMaxEffort) {
+        const r = injectFrontendMaxEffort(content);
+        if (!r.found) WARN('Frontend reasoning-effort switch not found (ST internals changed?)');
+        if (r.changed) notes.push('OpenRouter -> keep max effort');
         content = r.content;
     }
 
