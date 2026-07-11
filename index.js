@@ -103,6 +103,7 @@ const CACHING_DEFAULTS = {
     enableSystemPromptCache: true,
     cachingAtDepth: 12,
     extendedTTL: true,
+    patchCustomSource: false,
 };
 
 function normalizeCaching(input) {
@@ -113,6 +114,7 @@ function normalizeCaching(input) {
         enableSystemPromptCache: c.enableSystemPromptCache !== false,
         cachingAtDepth: Number.isInteger(depth) && depth >= -1 ? depth : CACHING_DEFAULTS.cachingAtDepth,
         extendedTTL: c.extendedTTL !== false,
+        patchCustomSource: Boolean(c.patchCustomSource),
     };
 }
 
@@ -414,6 +416,44 @@ function injectBackendVerbosityLink(content) {
     return { content: newContent, changed: newContent !== content, found: true };
 }
 
+/**
+ * Custom (OpenAI-compatible) source cache breakpoints (backend, chat-completions.js).
+ *
+ * ST only applies Claude cache_control markers on the Claude and OpenRouter
+ * branches. Gateways like Vercel AI Gateway are used through the CUSTOM source
+ * and pass content-block cache_control straight through to Anthropic, so we
+ * inject the same two caching calls into the CUSTOM branch, gated on the model
+ * name containing "claude". Idempotent via a marker comment.
+ */
+function injectCustomSourceCaching(content) {
+    const marker = 'claude-model-patcher: cache breakpoints for custom source';
+    if (content.includes(marker)) {
+        return { content, changed: false, found: true };
+    }
+    // Anchor on the CUSTOM branch's unique adjacent pair: the custom headers
+    // merge immediately followed by the media embed. (The embed call alone also
+    // exists in the OPENAI branch, and a bare CUSTOM check exists elsewhere.)
+    const re = /(mergeObjectWithYaml\(headers, request\.body\.custom_include_headers\);\r?\n\s*embedOpenRouterMedia\(request\.body\.messages, \{ audio: true, video: false \}\);)/;
+    const m = content.match(re);
+    if (!m) {
+        return { content, changed: false, found: false };
+    }
+    const inject =
+        '\n\n' +
+        `            // ${marker}\n` +
+        "            if (Array.isArray(request.body.messages) && /(?:^|\\/)claude[-_.]/i.test(String(request.body.model || ''))) {\n" +
+        '                if (enableSystemPromptCache) {\n' +
+        '                    cachingSystemPromptForOpenRouter(request.body.messages, cacheTTL);\n' +
+        '                }\n' +
+        '                if (cachingAtDepth !== -1) {\n' +
+        '                    cachingAtDepthForOpenRouterClaude(request.body.messages, cachingAtDepth, cacheTTL);\n' +
+        '                }\n' +
+        '            }';
+    const replacement = `${m[1]}${inject}`;
+    const newContent = content.replace(re, () => replacement);
+    return { content: newContent, changed: newContent !== content, found: true };
+}
+
 function backupOnce(file) {
     const bak = `${file}.cmp-bak`;
     if (!fs.existsSync(bak)) {
@@ -478,6 +518,13 @@ function patchBackend(cfg) {
         const r = injectBackendVerbosityLink(content);
         if (!r.found) WARN('OpenRouter reasoning/verbosity block not found (ST internals changed?)');
         if (r.changed) notes.push('OpenRouter -> verbosity=max on max effort');
+        content = r.content;
+    }
+
+    if (cfg.caching && cfg.caching.patchCustomSource) {
+        const r = injectCustomSourceCaching(content);
+        if (!r.found) WARN('CUSTOM source branch not found (ST internals changed?)');
+        if (r.changed) notes.push('CUSTOM source -> claude cache breakpoints');
         content = r.content;
     }
 

@@ -186,7 +186,8 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-ClaudeModelPatcher/
     "manage": true,
     "enableSystemPromptCache": true,
     "cachingAtDepth": 12,
-    "extendedTTL": true
+    "extendedTTL": true,
+    "patchCustomSource": false
 }
 ```
 
@@ -196,6 +197,7 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-ClaudeModelPatcher/
 | `enableSystemPromptCache` | 缓存系统提示词+角色卡+工具列表。 |
 | `cachingAtDepth` | 消息区打点深度。**填"发原文的楼层数 + 2"**：比如摘要方案只放行 10 层内原文就填 `12`；换成 20 层就填 `22`。`-1` = 关闭深度打点。聊天不足该深度时自动跳过，不影响系统提示词缓存。 |
 | `extendedTTL` | `true` = 缓存保 1 小时（写入贵一点，读 1 折）；`false` = 5 分钟。回合间隔常超 5 分钟建议开。 |
+| `patchCustomSource`（v1.2 新增） | `true` 时给 ST 的**自定义(OpenAI兼容)源**也打上同样的缓存断点补丁（改的是 ST 源码而非 config.yaml，不受 `manage` 影响）。原版 ST 只在 Claude 和 OpenRouter 源加缓存标记，走自定义源的中转（如 **Vercel AI Gateway**）享受不到缓存；开启后只要模型名带 `claude`（如 `anthropic/claude-fable-5`），就自动按上面的开关和打点深度加 `cache_control` 标记。前提：中转必须原样透传 `cache_control`（Vercel AI Gateway 已实测支持，含 1h TTL）。 |
 
 修改后同样**需要重启 SillyTavern** 生效（ST 启动时才读 config.yaml）。
 首次修改前会备份 `config.yaml.cmp-bak`。
