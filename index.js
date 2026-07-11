@@ -84,11 +84,37 @@ function loadConfig() {
     cfg.patchFrontend = cfg.patchFrontend !== false;
     cfg.openrouterMaxEffort = cfg.openrouterMaxEffort !== false;
     cfg.models = Array.isArray(cfg.models) ? cfg.models : [];
+    cfg.caching = normalizeCaching(cfg.caching);
     return cfg;
 }
 
 const VALID_THINKING = ['adaptive', 'extended', 'none'];
 const BOOL_FLAGS = ['context1m', 'noSampling', 'noPrefill', 'verbosity', 'webSearch', 'limitedSampling'];
+
+/**
+ * Prompt-caching settings written into ST's config.yaml (claude: section).
+ * manage=false leaves config.yaml completely untouched.
+ * cachingAtDepth: -1 disables depth caching; otherwise place it 2 above the
+ * boundary where message content stops changing (e.g. summaries beyond
+ * layer 10 -> 12).
+ */
+const CACHING_DEFAULTS = {
+    manage: false,
+    enableSystemPromptCache: true,
+    cachingAtDepth: 12,
+    extendedTTL: true,
+};
+
+function normalizeCaching(input) {
+    const c = (input && typeof input === 'object') ? input : {};
+    const depth = Number(c.cachingAtDepth);
+    return {
+        manage: Boolean(c.manage),
+        enableSystemPromptCache: c.enableSystemPromptCache !== false,
+        cachingAtDepth: Number.isInteger(depth) && depth >= -1 ? depth : CACHING_DEFAULTS.cachingAtDepth,
+        extendedTTL: c.extendedTTL !== false,
+    };
+}
 
 /**
  * Validate and normalize a config object coming from the settings panel before
@@ -102,6 +128,8 @@ function sanitizeConfig(input) {
         openrouterMaxEffort: input.openrouterMaxEffort !== false,
         backendFile: typeof input.backendFile === 'string' ? input.backendFile : '',
         frontendFile: typeof input.frontendFile === 'string' ? input.frontendFile : '',
+        configYamlFile: typeof input.configYamlFile === 'string' ? input.configYamlFile : '',
+        caching: normalizeCaching(input.caching),
         models: [],
     };
     const models = Array.isArray(input.models) ? input.models : [];
@@ -152,6 +180,73 @@ function resolveFrontendFile(cfg) {
         path.resolve(process.cwd(), 'public', 'scripts', 'openai.js'),
     ];
     return candidates.find(p => fs.existsSync(p)) || null;
+}
+
+function resolveConfigYamlFile(cfg) {
+    if (cfg.configYamlFile && fs.existsSync(cfg.configYamlFile)) return cfg.configYamlFile;
+    const candidates = [
+        path.resolve(__dirname, '..', '..', 'config.yaml'),
+        path.resolve(__dirname, '..', '..', '..', 'config.yaml'),
+        path.resolve(process.cwd(), 'config.yaml'),
+    ];
+    return candidates.find(p => fs.existsSync(p)) || null;
+}
+
+/**
+ * Write the prompt-caching keys into the `claude:` section of ST's config.yaml.
+ * ST reads these once at startup (module-scoped constants in
+ * chat-completions.js), so a restart is required after any change. Keys that
+ * are missing from the section (older configs) are appended to it.
+ */
+function patchConfigYaml(cfg) {
+    const c = cfg.caching;
+    const file = resolveConfigYamlFile(cfg);
+    if (!file) {
+        ERR('Could not locate config.yaml. Set "configYamlFile" in config.json to an absolute path.');
+        return { ok: false, changed: false };
+    }
+    LOG(`config.yaml target: ${file}`);
+
+    const content = fs.readFileSync(file, 'utf8');
+    const sectionRe = /(^claude:[ \t]*\r?\n)((?:[ \t]+\S.*\r?\n?|[ \t]*\r?\n)*)/m;
+    const m = content.match(sectionRe);
+    if (!m) {
+        ERR('config.yaml: "claude:" section not found (ST version too old?)');
+        return { ok: false, changed: false };
+    }
+
+    const eol = content.includes('\r\n') ? '\r\n' : '\n';
+    let block = m[2];
+    const notes = [];
+    const sets = [
+        ['enableSystemPromptCache', String(c.enableSystemPromptCache)],
+        ['cachingAtDepth', String(c.cachingAtDepth)],
+        ['extendedTTL', String(c.extendedTTL)],
+    ];
+    for (const [key, value] of sets) {
+        const keyRe = new RegExp(`^([ \\t]+${key}:[ \\t]*)(.*?)([ \\t]*(?:#.*)?)$`, 'm');
+        const km = block.match(keyRe);
+        if (km) {
+            if (km[2] !== value) {
+                block = block.replace(keyRe, (s, p1, _old, p3) => `${p1}${value}${p3}`);
+                notes.push(`${key}=${value}`);
+            }
+        } else {
+            if (!block.endsWith('\n')) block += eol;
+            block += `  ${key}: ${value}${eol}`;
+            notes.push(`${key}=${value} (added)`);
+        }
+    }
+
+    if (notes.length === 0) {
+        LOG('config.yaml already up to date, no changes needed.');
+        return { ok: true, changed: false };
+    }
+    backupOnce(file);
+    const newContent = content.slice(0, m.index) + m[1] + block + content.slice(m.index + m[0].length);
+    fs.writeFileSync(file, newContent, 'utf8');
+    LOG('config.yaml patched:', notes.join(', '));
+    return { ok: true, changed: true };
 }
 
 /**
@@ -440,13 +535,13 @@ function patchFrontend(cfg) {
     return { ok: true, changed: false };
 }
 
-let lastResult = { backend: null, frontend: null, ranAt: null };
+let lastResult = { backend: null, frontend: null, configYaml: null, ranAt: null };
 
 function runPatch() {
     const cfg = loadConfig();
     if (!cfg.enabled) {
         LOG('Disabled via config (enabled: false). Skipping.');
-        lastResult = { backend: { ok: true, changed: false, skipped: true }, frontend: null, ranAt: new Date().toISOString() };
+        lastResult = { backend: { ok: true, changed: false, skipped: true }, frontend: null, configYaml: null, ranAt: new Date().toISOString() };
         return lastResult;
     }
     if (cfg.models.length === 0) {
@@ -455,10 +550,11 @@ function runPatch() {
 
     const backend = patchBackend(cfg);
     const frontend = cfg.patchFrontend ? patchFrontend(cfg) : { ok: true, changed: false, skipped: true };
+    const configYaml = cfg.caching.manage ? patchConfigYaml(cfg) : { ok: true, changed: false, skipped: true };
 
-    lastResult = { backend, frontend, ranAt: new Date().toISOString() };
+    lastResult = { backend, frontend, configYaml, ranAt: new Date().toISOString() };
 
-    if (backend.changed || frontend.changed) {
+    if (backend.changed || frontend.changed || configYaml.changed) {
         LOG('============================================================');
         LOG('  Patch applied. RESTART SillyTavern once for it to take effect.');
         LOG('============================================================');

@@ -29,7 +29,6 @@ SillyTavern 是用**写死的正则表达式**（在 `src/endpoints/backends/cha
 - **幂等**：已经打过补丁不会重复修改。
 - **自动备份**：第一次修改前生成 `*.cmp-bak` 备份。
 - **配置驱动**：以后出 `opus-4-9` 只要改 `config.json`，不用改代码。
-- **OpenRouter 极高思考修复**：修好「OpenRouter 选『极高』却只传 `high`」的问题（见下方专节）。
 - **手机端友好**：手机上独立安装的 ST（如 Termux）同样可用。
 
 ---
@@ -132,7 +131,6 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-ClaudeModelPatcher/
 {
     "enabled": true,
     "patchFrontend": true,
-    "openrouterMaxEffort": true,
     "backendFile": "",
     "frontendFile": "",
     "models": [
@@ -154,8 +152,7 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-ClaudeModelPatcher/
 | 字段 | 说明 |
 |------|------|
 | `enabled` | `false` 时完全不打补丁。 |
-| `patchFrontend` | 是否同时给前端 `openai.js` 打补丁（1M 上下文上限、OpenRouter 极高思考修复）。 |
-| `openrouterMaxEffort` | 是否启用「OpenRouter 极高思考修复」，默认 `true`。见下方专节。 |
+| `patchFrontend` | 是否同时给前端 `openai.js` 打补丁（仅用于 1M 上下文上限）。 |
 | `backendFile` / `frontendFile` | 自动定位失败时，手动填**绝对路径**。一般留空即可。 |
 | `models[]` | 要添加的模型列表，见下。 |
 
@@ -179,23 +176,29 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-ClaudeModelPatcher/
 
 ---
 
-## OpenRouter 极高思考修复
+## 提示词缓存管理（v1.1 新增）
 
-**问题**：用 OpenRouter 来源时，把推理强度选成「极高（max）」，实际传给模型的却还是
-`high`——因为 ST 前端 `getReasoningEffort()` 里把所有走字符串强度的来源都强制
-`max → high` 降级了，而 Claude 自适应模型其实合法支持 `max` 这一档。
+插件可以顺便接管 ST 的 **Claude 提示词缓存**设置（写入 `config.yaml` 的 `claude:` 段），
+在前端面板里就能改，不用手动编辑 config.yaml：
 
-**修复**（由 `openrouterMaxEffort: true` 控制，默认开启），打两处补丁：
+```json
+"caching": {
+    "manage": true,
+    "enableSystemPromptCache": true,
+    "cachingAtDepth": 12,
+    "extendedTTL": true
+}
+```
 
-1. **前端 `openai.js`**：当来源是 **OpenRouter 且模型名含 `claude`** 时，选「极高」保留
-   `max`、不再降级成 `high`。其它来源、其它模型完全不受影响。
-2. **后端 `chat-completions.js`**：当 `reasoning_effort === 'max'` 且模型是
-   `anthropic/claude...` 时，把 `verbosity` 也一并镜像成 `max`（兜底——防止 OpenRouter
-   对最新 Claude 读的是 `verbosity` 而非 `reasoning.effort`）。两条一起上，无论 OpenRouter
-   内部读哪个字段都能把 `max` 传到底。
+| 字段 | 说明 |
+|------|------|
+| `manage` | `true` 才会写 config.yaml；`false` 完全不碰。 |
+| `enableSystemPromptCache` | 缓存系统提示词+角色卡+工具列表。 |
+| `cachingAtDepth` | 消息区打点深度。**填"发原文的楼层数 + 2"**：比如摘要方案只放行 10 层内原文就填 `12`；换成 20 层就填 `22`。`-1` = 关闭深度打点。聊天不足该深度时自动跳过，不影响系统提示词缓存。 |
+| `extendedTTL` | `true` = 缓存保 1 小时（写入贵一点，读 1 折）；`false` = 5 分钟。回合间隔常超 5 分钟建议开。 |
 
-两处都带 `claude-model-patcher:` 标记，幂等；不想要这个修复就把 `openrouterMaxEffort`
-设为 `false`。
+修改后同样**需要重启 SillyTavern** 生效（ST 启动时才读 config.yaml）。
+首次修改前会备份 `config.yaml.cmp-bak`。
 
 ---
 

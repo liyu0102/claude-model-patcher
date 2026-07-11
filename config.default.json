@@ -4,6 +4,13 @@
     "openrouterMaxEffort": true,
     "backendFile": "",
     "frontendFile": "",
+    "configYamlFile": "",
+    "caching": {
+        "manage": false,
+        "enableSystemPromptCache": true,
+        "cachingAtDepth": 12,
+        "extendedTTL": true
+    },
     "models": [
         {
             "id": "claude-opus-4-8",

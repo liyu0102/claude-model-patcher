@@ -1,7 +1,7 @@
 {
     "name": "claude-model-patcher",
-    "version": "1.0.0",
-    "description": "SillyTavern server plugin that patches new/custom Claude models (e.g. claude-opus-4-8) into ST's thinking-mode logic so they use the correct thinking behaviour (adaptive / extended / none).",
+    "version": "1.1.0",
+    "description": "SillyTavern server plugin that patches new/custom Claude models (e.g. claude-opus-4-8) into ST's thinking-mode logic, and manages Claude prompt-caching settings (enableSystemPromptCache / cachingAtDepth / extendedTTL) in config.yaml.",
     "type": "module",
     "main": "index.js",
     "license": "MIT",
