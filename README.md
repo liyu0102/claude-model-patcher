@@ -186,16 +186,20 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-ClaudeModelPatcher/
     "manage": true,
     "enableSystemPromptCache": true,
     "cachingAtDepth": 12,
+    "depthMode": "switches",
     "extendedTTL": true,
-    "patchCustomSource": false
+    "patchCustomSource": false,
+    "debug": false
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
 | `manage` | `true` 才会写 config.yaml；`false` 完全不碰。 |
-| `enableSystemPromptCache` | 缓存系统提示词+角色卡+工具列表。 |
+| `enableSystemPromptCache` | 缓存系统提示词+角色卡+工具列表（相当于"角色定义后"打点）。 |
 | `cachingAtDepth` | 消息区打点深度。**填"发原文的楼层数 + 2"**：比如摘要方案只放行 10 层内原文就填 `12`；换成 20 层就填 `22`。`-1` = 关闭深度打点。聊天不足该深度时自动跳过，不影响系统提示词缓存。 |
+| `depthMode`（v1.3 新增） | 打点位置的**计数方式**，类似世界书选注入位置：<br>`"switches"` = ST 原生，从底往上数 **user/assistant 角色轮换次数**。适合每层都发原文的常规聊天。**缺陷**：连续同角色消息（如"N 层外只发摘要"方案里的纯 assistant 摘要区）会被 Claude 转换器合并成一条消息、整个区只算 1 层深度，配置的深度可能永远数不到 → 聊天区断点根本打不上。<br>`"blocks"` = 按**楼层/文本块**计数：每条原始楼层即使被合并也各算 1 块，从底往上数第 N 块打点，断点可以落进合并后的摘要区内部。**摘要流强烈推荐**。 |
+| `debug` | `true` 时在 ST 控制台打印每个断点实际落点（第几条消息 / 哪个文本块 / 内容预览），方便核对深度。 |
 | `extendedTTL` | `true` = 缓存保 1 小时（写入贵一点，读 1 折）；`false` = 5 分钟。回合间隔常超 5 分钟建议开。 |
 | `patchCustomSource`（v1.2 新增） | `true` 时给 ST 的**自定义(OpenAI兼容)源**也打上同样的缓存断点补丁（改的是 ST 源码而非 config.yaml，不受 `manage` 影响）。原版 ST 只在 Claude 和 OpenRouter 源加缓存标记，走自定义源的中转（如 **Vercel AI Gateway**）享受不到缓存；开启后只要模型名带 `claude`（如 `anthropic/claude-fable-5`），就自动按上面的开关和打点深度加 `cache_control` 标记。前提：中转必须原样透传 `cache_control`（Vercel AI Gateway 已实测支持，含 1h TTL）。 |
 

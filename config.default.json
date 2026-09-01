@@ -9,8 +9,10 @@
         "manage": false,
         "enableSystemPromptCache": true,
         "cachingAtDepth": 12,
+        "depthMode": "switches",
         "extendedTTL": true,
-        "patchCustomSource": false
+        "patchCustomSource": false,
+        "debug": false
     },
     "models": [
         {

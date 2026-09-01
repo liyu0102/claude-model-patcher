@@ -102,9 +102,24 @@ const CACHING_DEFAULTS = {
     manage: false,
     enableSystemPromptCache: true,
     cachingAtDepth: 12,
+    depthMode: 'switches',
     extendedTTL: true,
     patchCustomSource: false,
+    debug: false,
 };
+
+/**
+ * depthMode controls how cachingAtDepth counts its way up from the bottom of
+ * the prompt before placing the cache_control breakpoints:
+ *  - 'switches': ST stock behaviour, counts user/assistant ROLE SWITCHES.
+ *    Breaks down when a long run of same-role messages (e.g. summary-only
+ *    assistant messages) gets merged into a single message: the whole run
+ *    counts as depth 1 and high depths are never reached.
+ *  - 'blocks': counts individual TEXT BLOCKS (one per original chat floor,
+ *    even inside merged messages), so the breakpoint can land inside a merged
+ *    summary region. Depth N = N-th text block from the bottom.
+ */
+const VALID_DEPTH_MODES = ['switches', 'blocks'];
 
 function normalizeCaching(input) {
     const c = (input && typeof input === 'object') ? input : {};
@@ -113,8 +128,10 @@ function normalizeCaching(input) {
         manage: Boolean(c.manage),
         enableSystemPromptCache: c.enableSystemPromptCache !== false,
         cachingAtDepth: Number.isInteger(depth) && depth >= -1 ? depth : CACHING_DEFAULTS.cachingAtDepth,
+        depthMode: VALID_DEPTH_MODES.includes(String(c.depthMode)) ? String(c.depthMode) : CACHING_DEFAULTS.depthMode,
         extendedTTL: c.extendedTTL !== false,
         patchCustomSource: Boolean(c.patchCustomSource),
+        debug: Boolean(c.debug),
     };
 }
 
@@ -131,6 +148,7 @@ function sanitizeConfig(input) {
         backendFile: typeof input.backendFile === 'string' ? input.backendFile : '',
         frontendFile: typeof input.frontendFile === 'string' ? input.frontendFile : '',
         configYamlFile: typeof input.configYamlFile === 'string' ? input.configYamlFile : '',
+        promptConvertersFile: typeof input.promptConvertersFile === 'string' ? input.promptConvertersFile : '',
         caching: normalizeCaching(input.caching),
         models: [],
     };
@@ -190,6 +208,16 @@ function resolveConfigYamlFile(cfg) {
         path.resolve(__dirname, '..', '..', 'config.yaml'),
         path.resolve(__dirname, '..', '..', '..', 'config.yaml'),
         path.resolve(process.cwd(), 'config.yaml'),
+    ];
+    return candidates.find(p => fs.existsSync(p)) || null;
+}
+
+function resolvePromptConvertersFile(cfg) {
+    if (cfg.promptConvertersFile && fs.existsSync(cfg.promptConvertersFile)) return cfg.promptConvertersFile;
+    const candidates = [
+        path.resolve(__dirname, '..', '..', 'src', 'prompt-converters.js'),
+        path.resolve(__dirname, '..', '..', '..', 'src', 'prompt-converters.js'),
+        path.resolve(process.cwd(), 'src', 'prompt-converters.js'),
     ];
     return candidates.find(p => fs.existsSync(p)) || null;
 }
@@ -454,6 +482,224 @@ function injectCustomSourceCaching(content) {
     return { content: newContent, changed: newContent !== content, found: true };
 }
 
+/**
+ * Debug logging for cache breakpoints (backend, src/prompt-converters.js).
+ *
+ * ST's cachingAtDepthForOpenRouterClaude places cache_control markers by walking
+ * messages from the newest backwards, counting ROLE SWITCHES (not message
+ * indices). Whether a breakpoint lands where you expect is impossible to see
+ * from config alone, so this injects a console.log at the exact spot a marker is
+ * applied, printing: the depth (role-switch count), the real message index, its
+ * distance from the bottom, the role, and the first 40 chars of that message.
+ * Also logs the total message count once per call. Idempotent via a marker.
+ */
+function injectCachingDebug(content) {
+    const marker = 'claude-model-patcher: caching debug log';
+    if (content.includes(marker)) {
+        return { content, changed: false, found: true };
+    }
+
+    // 1) Log once at function entry: total messages + the requested depth.
+    const entryRe = /(export function cachingAtDepthForOpenRouterClaude\(messages, cachingAtDepth, ttl\) \{\r?\n)/;
+    const em = content.match(entryRe);
+    if (!em) {
+        return { content, changed: false, found: false };
+    }
+    const entryLog =
+        `    // ${marker}\n` +
+        "    try { console.log('[claude-model-patcher] cachingAtDepth() called: totalMessages=' + (Array.isArray(messages) ? messages.length : 'N/A') + ', cachingAtDepth=' + cachingAtDepth + ', ttl=' + ttl); } catch (e) {}\n";
+    content = content.replace(entryRe, (s, p1) => `${p1}${entryLog}`);
+
+    // 2) Log at each breakpoint hit, inside the `if (depth === cachingAtDepth ...)`
+    //    block, right after the opening brace. Anchor on the exact condition line.
+    const hitRe = /(if \(depth === cachingAtDepth \|\| depth === cachingAtDepth \+ 2\) \{\r?\n)/;
+    const hm = content.match(hitRe);
+    if (!hm) {
+        // Entry log injected but hit anchor not found; still report what we did.
+        return { content, changed: content !== null, found: false };
+    }
+    const hitLog =
+        "                try { const __c = messages[i].content; const __t = typeof __c === 'string' ? __c : (Array.isArray(__c) ? (__c.map(p => p && p.text ? p.text : '').join(' ')) : ''); console.log('[claude-model-patcher] BREAKPOINT set: depth=' + depth + ', messageIndex=' + i + ', fromBottom=' + (messages.length - i) + ', role=' + messages[i].role + ', preview=' + JSON.stringify(String(__t).slice(0, 40))); } catch (e) {}\n";
+    content = content.replace(hitRe, (s, p1) => `${p1}${hitLog}`);
+
+    return { content, changed: true, found: true };
+}
+
+/**
+ * Remove the caching debug log injected by injectCachingDebug (used when the
+ * debug flag is turned off again). Idempotent.
+ */
+function removeCachingDebug(content) {
+    const marker = 'claude-model-patcher: caching debug log';
+    if (!content.includes(marker)) {
+        return { content, changed: false, found: true };
+    }
+    let out = content;
+    // Strip the two injected try/catch console.log lines and the marker comment.
+    out = out.replace(/[ \t]*\/\/ claude-model-patcher: caching debug log\r?\n/, '');
+    out = out.replace(/[ \t]*try \{ console\.log\('\[claude-model-patcher\] cachingAtDepth\(\) called:.*?\} catch \(e\) \{\}\r?\n/, '');
+    out = out.replace(/[ \t]*try \{ const __c = messages\[i\]\.content;.*?\} catch \(e\) \{\}\r?\n/, '');
+    return { content: out, changed: out !== content, found: true };
+}
+
+/**
+ * Block-depth caching mode (backend, src/prompt-converters.js).
+ *
+ * ST's stock cachingAtDepth counts user/assistant ROLE SWITCHES from the
+ * bottom. With summary-style setups the region above the "raw text" boundary
+ * is a long run of assistant-only summary messages, which the Claude converter
+ * merges into a SINGLE message — the whole region counts as depth 1 and the
+ * configured depth is never reached, so no chat breakpoint gets placed at all.
+ *
+ * Block mode instead counts individual TEXT BLOCKS from the bottom (each
+ * original chat floor stays its own block even after merging) and places the
+ * two cache_control markers on the N-th and (N+2)-th blocks. This lets the
+ * breakpoint land INSIDE the merged summary region, exactly like world-info
+ * "@ Depth N" positioning.
+ *
+ * The generated code is wrapped in BEGIN/END markers and fully regenerated on
+ * every patch run (settings like the debug flag are baked in), and the two
+ * stock functions get a small marker-tagged delegate at their entry.
+ */
+const CMP_REGION_BEGIN = '// >>> claude-model-patcher: block-depth caching BEGIN (auto-generated, do not edit)';
+const CMP_REGION_END = '// <<< claude-model-patcher: block-depth caching END';
+const CMP_DELEGATE_MARKER = 'claude-model-patcher: block-depth delegate';
+
+function buildBlockRegion(cfg) {
+    const debug = Boolean(cfg.caching && cfg.caching.debug);
+    return [
+        CMP_REGION_BEGIN,
+        `const CMP_CACHE_DEBUG = ${debug};`,
+        'function cmpCacheBlockMode() { return true; }',
+        'function cmpCachingAtBlockDepth(messages, blockDepth, ttl) {',
+        '    if (!Array.isArray(messages) || !Number.isInteger(blockDepth) || blockDepth < 0) return;',
+        "    if (CMP_CACHE_DEBUG) { try { console.log('[claude-model-patcher] block-depth caching: totalMessages=' + messages.length + ', blockDepth=' + blockDepth + ', ttl=' + ttl); } catch (e) {} }",
+        '    let passedThePrefill = false;',
+        '    let depth = 0;',
+        '    let marks = 0;',
+        '    const logHit = (i, j, role, text) => {',
+        "        if (!CMP_CACHE_DEBUG) return;",
+        "        try { console.log('[claude-model-patcher] BLOCK BREAKPOINT set: blockDepth=' + depth + ', messageIndex=' + i + ', partIndex=' + j + ', role=' + role + ', preview=' + JSON.stringify(String(text).slice(0, 40))); } catch (e) {}",
+        '    };',
+        '    outer:',
+        '    for (let i = messages.length - 1; i >= 0; i--) {',
+        '        const message = messages[i];',
+        '        if (!message) continue;',
+        "        if (!passedThePrefill && message.role === 'assistant') continue;",
+        '        passedThePrefill = true;',
+        "        if (message.role === 'system') continue;",
+        "        if (typeof message.content === 'string') {",
+        '            if (depth === blockDepth || depth === blockDepth + 2) {',
+        "                message.content = [{ type: 'text', text: message.content, cache_control: { type: 'ephemeral', ttl: ttl } }];",
+        '                marks++;',
+        '                logHit(i, 0, message.role, message.content[0].text);',
+        '                if (depth === blockDepth + 2) break;',
+        '            }',
+        '            depth += 1;',
+        '        } else if (Array.isArray(message.content)) {',
+        '            for (let j = message.content.length - 1; j >= 0; j--) {',
+        '                const part = message.content[j];',
+        "                if (!part || part.type !== 'text') continue;",
+        '                if (depth === blockDepth || depth === blockDepth + 2) {',
+        "                    part.cache_control = { type: 'ephemeral', ttl: ttl };",
+        '                    marks++;',
+        '                    logHit(i, j, message.role, part.text);',
+        '                    if (depth === blockDepth + 2) break outer;',
+        '                }',
+        '                depth += 1;',
+        '            }',
+        '        }',
+        '    }',
+        "    if (CMP_CACHE_DEBUG) { try { console.log('[claude-model-patcher] block-depth caching done: breakpointsPlaced=' + marks + ', totalBlocksCounted=' + depth); } catch (e) {} }",
+        '}',
+        CMP_REGION_END,
+    ].join('\n');
+}
+
+function removeBlockRegion(content) {
+    const re = new RegExp(`\\r?\\n?${CMP_REGION_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${CMP_REGION_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\r?\\n?`);
+    return content.replace(re, '\n');
+}
+
+function appendBlockRegion(content, cfg) {
+    if (!content.endsWith('\n')) content += '\n';
+    return content + buildBlockRegion(cfg) + '\n';
+}
+
+/**
+ * Insert the block-mode delegate at the top of both stock depth functions.
+ * cachingAtDepthForClaude handles the Claude direct source (merged messages);
+ * cachingAtDepthForOpenRouterClaude handles OpenRouter/custom sources.
+ */
+function injectBlockDelegates(content) {
+    let missing = [];
+    for (const fnName of ['cachingAtDepthForClaude', 'cachingAtDepthForOpenRouterClaude']) {
+        const fnMarker = `${CMP_DELEGATE_MARKER} (${fnName})`;
+        if (content.includes(fnMarker)) continue;
+        const re = new RegExp(`(export function ${fnName}\\(messages, cachingAtDepth, ttl\\) \\{\\r?\\n)`);
+        if (!re.test(content)) {
+            missing.push(fnName);
+            continue;
+        }
+        const inject =
+            `    // ${fnMarker}\n` +
+            '    if (typeof cmpCacheBlockMode === \'function\' && cmpCacheBlockMode()) { return cmpCachingAtBlockDepth(messages, cachingAtDepth, ttl); }\n';
+        content = content.replace(re, (s, p1) => `${p1}${inject}`);
+    }
+    return { content, missing };
+}
+
+function removeBlockDelegates(content) {
+    const re = new RegExp(`[ \\t]*// ${CMP_DELEGATE_MARKER} \\((\\w+)\\)\\r?\\n[ \\t]*if \\(typeof cmpCacheBlockMode[^\\r\\n]*\\r?\\n`, 'g');
+    return content.replace(re, '');
+}
+
+function patchPromptConverters(cfg) {
+    const file = resolvePromptConvertersFile(cfg);
+    if (!file) {
+        WARN('Could not locate src/prompt-converters.js; skipping caching debug log.');
+        return { ok: false, changed: false };
+    }
+    LOG(`prompt-converters target: ${file}`);
+
+    let content = fs.readFileSync(file, 'utf8');
+    const original = content;
+    const wantDebug = Boolean(cfg.caching && cfg.caching.debug);
+    const wantBlocks = Boolean(cfg.caching && cfg.caching.depthMode === 'blocks');
+
+    const r = wantDebug ? injectCachingDebug(content) : removeCachingDebug(content);
+    if (wantDebug && !r.found) {
+        WARN('cachingAtDepthForOpenRouterClaude() not found (ST internals changed?)');
+    }
+    content = r.content;
+
+    // Block-depth mode: the region is fully regenerated on every run so baked
+    // settings (debug flag) stay in sync with the config.
+    content = removeBlockRegion(content);
+    if (wantBlocks) {
+        content = appendBlockRegion(content, cfg);
+        const d = injectBlockDelegates(content);
+        content = d.content;
+        if (d.missing.length) {
+            WARN(`Block-depth delegate anchor not found for: ${d.missing.join(', ')} (ST internals changed?)`);
+        }
+    } else {
+        content = removeBlockDelegates(content);
+    }
+
+    if (content !== original) {
+        backupOnce(file);
+        fs.writeFileSync(file, content, 'utf8');
+        const notes = [];
+        notes.push(wantDebug ? 'debug log ON' : 'debug log off');
+        notes.push(wantBlocks ? 'depth mode = blocks (楼层块)' : 'depth mode = switches (ST 原生)');
+        LOG(`prompt-converters.js patched: ${notes.join(', ')}`);
+        return { ok: true, changed: true };
+    }
+    LOG('prompt-converters.js already up to date, no changes needed.');
+    return { ok: true, changed: false };
+}
+
 function backupOnce(file) {
     const bak = `${file}.cmp-bak`;
     if (!fs.existsSync(bak)) {
@@ -598,10 +844,11 @@ function runPatch() {
     const backend = patchBackend(cfg);
     const frontend = cfg.patchFrontend ? patchFrontend(cfg) : { ok: true, changed: false, skipped: true };
     const configYaml = cfg.caching.manage ? patchConfigYaml(cfg) : { ok: true, changed: false, skipped: true };
+    const promptConverters = patchPromptConverters(cfg);
 
-    lastResult = { backend, frontend, configYaml, ranAt: new Date().toISOString() };
+    lastResult = { backend, frontend, configYaml, promptConverters, ranAt: new Date().toISOString() };
 
-    if (backend.changed || frontend.changed || configYaml.changed) {
+    if (backend.changed || frontend.changed || configYaml.changed || promptConverters.changed) {
         LOG('============================================================');
         LOG('  Patch applied. RESTART SillyTavern once for it to take effect.');
         LOG('============================================================');
